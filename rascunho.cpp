@@ -274,7 +274,7 @@ bool OrderBook::change_order(Order& order, OrderChange& order_change) {
                 it_list->value = order_change.qty;
                 auto new_it_map = it_map;
                 if (order_change.price != order.price) {
-                    // time: O(1); memory: O(1).
+                    // time: O(log n); memory: O(1).
                     // Moves the order to other price list.
                     new_it_map = book[order.side].try_emplace(order_change.price).first;
                     if (it_map->second.empty())

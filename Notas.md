@@ -189,6 +189,9 @@ O mesmo funciona para uma ordem peg to offer.
 - Market-limit Order
     - Market-limit orders are executed at the best price available in the market. If the market-limit order can only be partially filled, the order becomes a limit order and the remaining quantity remains on the order book at the specified limit price.
 
+- Market (not -limit) Order
+    - Are executed-or-canceled.
+
 
 ## Algoritmos
 
