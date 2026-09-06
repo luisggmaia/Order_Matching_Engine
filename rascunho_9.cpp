@@ -167,19 +167,26 @@ OrderBook::OrderBook() {
 }
 
 /* time: O(1); memory: O(1). */
-bool OrderBook::resolve_top(Side s) noexcept {
+bool OrderBook::resolve_top_queues(Side s) noexcept {
     BookMap& lim_map_ = lim_map(s);
     if (lim_map_.empty())
         return false;
+    
+    TopQueues& t_q = top_queues(s);
+    // t_q.peg_queue = peg_queue(s);
+    t_q.lim_queue = lim_map_.begin()->second;
+    t_q.price = price_of(s, lim_map_.begin()->first);
+}
 
-    auto lim_book_it = lim_map_.begin(); // time: O(1); memory: O(1)
-    OrderQueue& lim_queue_ = lim_book_it->second;
-    OrderQueue& peg_queue_ = peg_queue(s);
+bool OrderBook::resolve_top_order(Side s) noexcept {
+    TopQueues& t_q = top_queues(s);
+    OrderList& peg_queue = peg_queues(s);
+    if (peg_queue.empty() && t_q.lim_queue.empty())
+        return false;
 
-    Top& t = top(s);
-    t.price = price_of(s, lim_book_it->first);
-    t.is_peg = !peg_queue_.empty() && peg_queue_.front().seq < lim_queue_.front().seq;
-    t.queue = t.is_peg ? &peg_queue_ : &lim_queue_;
+    TopOrder& t = top_order(s);
+    t.is_peg = !peg_queue.empty() && peg_queue.front().seq < t_q.lim_queue.front().seq;
+    t.queue = t.is_peg ? &peg_queue : &t_q.lim_queue;
     t.order = &t.queue->front();
     return true;
 }
@@ -197,37 +204,53 @@ void OrderBook::execute(Order& bid, Order& offer, int price) {
 }
 
 void OrderBook::run_matching() {
-    // time: O(1); memory: O(1) per break-condition evaluation.
-    while (resolve_top(Side::Buy) && resolve_top(Side::Sell)) {
-        // time: O(1); memory: O(1).
-        Top& buy = top(Side::Buy);
-        Top& sell = top(Side::Sell);
 
-        if (buy.price < sell.price)
-            // There is no trade when bid < offer
+    while (resolve_top_queues(Side::Buy) && resolve_top_queues(Side::Sell)) {
+
+        TopQueues& buy_t_q = top_queues(Side::Buy);
+        TopQueues& offer_t_q = top_queues(Side::Sell);
+
+        if (buy_t_q.price < offer_t_q.price)
             break;
 
-        const int price = (buy.order->seq < sell.order->seq) ? buy.price : sell.price;
-        // time: O(1) amortized; memory: O(1) amortized.
-        execute(*buy.order, *sell.order, price);
+        while (resolve_top_order(Side::Buy) && resolve_top_order(Side::Sell)) {
+            // time: O(1); memory: O(1).
+            Top& buy_t = top(Side::Buy);
+            Top& sell_t = top(Side::Sell);
 
-        // time: O(1), O(log n) when the level empties; memory: O(1).
-        if (buy.order->qty == 0)
-            retire_top(Side::Buy);
-        if (sell.order->qty == 0)
-            retire_top(Side::Sell);
+            const int price = (buy_t.order->seq < sell_t.order->seq) ? buy_t.price : sell_t.price;
+            // time: O(1) amortized; memory: O(1) amortized.
+            execute(*buy_t.order, *sell_t.order, price);
+
+            // time: O(1), O(log n) when the level empties; memory: O(1).
+            if (buy_t.order->qty == 0)
+                retire_top_order(Side::Buy);
+            if (sell_t.order->qty == 0)
+                retire_top_order(Side::Sell);
+
+
+        }
+
+        retire_top_queue(Side::Buy);
+        retire_top_queue(Side::Sell);
     }
 }
 
+void OrderBook::retire_top_queue(Side s) {
+    TopQueues& t_q = top_queues(s);
+
+    if (t_q.lim_queue->empty())
+        // If the list empties.
+        lim_map(s).erase(t_q.price); // time: O(1), memory: O(1).
+    
+    t_q.lim_queue = nullptr;
+}
+
 /* time: O(1), O(log n) when the level empties; memory: O(1). */
-void OrderBook::retire_top(Side s) {
-    Top& t = top(s);
+void OrderBook::retire_top_order(Side s) {
+    Top& t = top_order(s);
 
     history_.splice(history_.begin(), *t.queue, t.queue->begin()); // time: O(1), memory: O(1).
-
-    if (!t.is_peg && t.queue->empty())
-        // If the list empties.
-        lim_map(s).erase(key_of(s, t.price)); // time: O(1), memory: O(1).
 
     t.order = nullptr;
     t.queue  = nullptr;

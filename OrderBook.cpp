@@ -1,185 +1,40 @@
-#include <string>
-#include <list>
-#include <vector>
-#include <algorithm>
-#include <optional>
-#include <cassert>
+#include "OrderBook.hpp"
 
-#include "OrderedMap.hpp"
+#include <algorithm>
+#include <cassert>
 
 namespace orderbook {
 
-enum class Type : char { Limit, Market, Peg };
-
-enum class Side : bool { Sell, Buy };
-
-static_assert(static_cast<std::size_t>(Side::Sell) == 0);
-static_assert(static_cast<std::size_t>(Side::Buy) == 1);
-
-enum class Status : char { Active, Partial, Total, Cancelled };
-
-// Grouped fields due to alignment (memory efficiency).
-// 20 Bytes.
-struct Order {
-    public:
-        int    get_id()     const noexcept { return id; }
-        int    get_qty()    const noexcept { return qty; }
-        int    get_price()  const noexcept { return price; }
-        Type   get_type()   const noexcept { return type; }
-        Side   get_side()   const noexcept { return side; }
-        Status get_status() const noexcept { return status; }
-
-    private:
-        Order(Type t, Side s, int q, int p) noexcept : 
-            qty(q), price(p), id(0), seq(0),
-            type(t), side(s), status(Status::Active) {}
-
-        int qty, price, id, seq;
-        Type type;
-        Side side;
-        Status status;
-
-        friend class OrderBook;
-};
-
-// 20 Bytes.
-struct Trade {
-    int price, qty;
-    int bid_id, offer_id;
-    Side aggressor; // Aggressor side.
-};
-
-enum class Reject : char {
-    None,
-    NotFound,
-    AlreadyCanceled,
-    AlreadyFilled,
-    NotResting,
-    NoMarketPrice,
-    MissingPrice,
-    UnexpectedPrice,
-    InvalidQty
-};
-
-inline constexpr const char* to_string(Reject r) noexcept {
-    switch (r) {
-        case Reject::None:            return "ok";
-        case Reject::NotFound:        return "order not found";
-        case Reject::AlreadyCanceled: return "order already canceled";
-        case Reject::AlreadyFilled:   return "order already totally executed";
-        case Reject::NotResting:      return "market order does not rest in the book";
-        case Reject::NoMarketPrice:   return "no market price - insert a limit order first";
-        case Reject::MissingPrice:    return "limit order requires a price";
-        case Reject::UnexpectedPrice: return "market/peg order must not carry a price";
-        case Reject::InvalidQty:      return "quantity must be positive";
-    }
-    return "unknown";
-}
-
-inline constexpr std::size_t idx(Side s) noexcept {
-    return static_cast<std::size_t>(s);
-}
-inline constexpr Side opposite(Side s) noexcept {
-    return static_cast<Side>(idx(s) ^ 1u);
-}
-
-// ------------------------------------------------------------ OrderBook ----
-
-class OrderBook {
-    public:
-        // 8 Bytes.
-        struct OpResult {
-            OpResult(Reject r, int i = -1) : id(i), reject(r) {}
-
-            int id = -1;
-            Reject reject = Reject::None;
-            bool check() const noexcept { return reject == Reject::None; }
-        };
-
-        // 16 Bytes.
-        struct BookOut {
-            int id, qty, price;
-            Type type;
-            Status status;
-        };
-
-    public:
-        OrderBook();
-        OpResult insert_order(Type type, Side side, int qty,
-                                  std::optional<int> price = std::nullopt);
-        OpResult cancel_order(int order_id);
-        OpResult change_order(int order_id, int new_qty,
-                            std::optional<int> new_price = std::nullopt);
-        
-        std::vector<BookOut> book_view(Side s) const;
-        const Order* locate_order(int order_id) const;
-
-        const std::vector<Trade>& pending_trades() const noexcept { return trades_; }
-        void clear_trades() noexcept { trades_.clear(); }
-
-    private:
-        using OrderQueue = std::list<Order>;
-        using BookMap = OrderedMap<int, OrderQueue>;
-
-        static constexpr int key_of(Side s, int price) noexcept {
-            return (s == Side::Buy) ? -price : price;
-        }
-        static constexpr int price_of(Side s, int key) noexcept {
-            return (s == Side::Buy) ? -key : key;
-        }
-
-        // 24 Bytes (in a 64-bit machine; 16 Bytes in a 32-bit).
-        struct Top {
-            OrderQueue* queue = nullptr;
-            Order* order = nullptr;
-            int price = 0;
-            bool is_peg = false;
-        };
-
-        BookMap&          lim_map(Side s)         noexcept { return lim_book_[idx(s)]; }
-        const BookMap&    lim_map(Side s)   const noexcept { return lim_book_[idx(s)]; }
-        OrderQueue&       peg_queue(Side s)       noexcept { return peg_book_[idx(s)]; }
-        const OrderQueue& peg_queue(Side s) const noexcept { return peg_book_[idx(s)]; }
-        Top&              top(Side s)             noexcept { return top_[idx(s)]; }
-
-        bool resolve_top(Side s) noexcept;
-        void execute(Order& bid, Order& offer, int price);
-        void retire_top(Side s);
-        void run_matching();
-
-        // The index order of map_book must be kept according to Side struct: Side::Sell = 0, Side::Buy = 1.
-        // Although both BookMaps are equal in type, the buy map will be ordered in decreasing order by
-        // rewriting its index with opposite (minus) sign. The order price will keep the same.
-        BookMap lim_book_[2];
-        OrderQueue peg_book_[2];
-        OrderQueue history_;
-        std::vector<OrderQueue::iterator> ids_;
-        Top top_[2];
-        std::vector<Trade> trades_;
-
-        int seq_count_ = 0; // book time.
-        int id_count_ = 0; // order id counter.
-};
-
-OrderBook::OrderBook() {
+OrderBook::OrderBook(std::size_t capacity_hint) {
     trades_.reserve(64);
-    ids_.reserve(64);
+    ids_.reserve(capacity_hint);
 }
 
 /* time: O(1); memory: O(1). */
-bool OrderBook::resolve_top(Side s) noexcept {
-    BookMap& lim_map_ = lim_map(s);
-    if (lim_map_.empty())
+bool OrderBook::resolve_top_queue(Side s) noexcept {
+    auto& top_map = lim_map(s);
+    if (top_map.empty())
+        return false;
+    
+    auto map_it = top_map.begin(); // time: O(1); memory: O(1)
+    TopQueue& t_q = top_queue(s);
+    t_q.lim_queue = &map_it->second;
+    t_q.price = price_of(s, map_it->first);
+    return true;
+}
+
+/* time: O(1); memory: O(1). */
+bool OrderBook::resolve_top_order(Side s) noexcept {
+    TopQueue& t_q = top_queue(s);
+    OrderQueue& peg_queue_ = peg_queue(s);
+    assert(t_q.lim_queue != nullptr);
+
+    if (peg_queue_.empty() && t_q.lim_queue->empty())
         return false;
 
-    auto lim_book_it = lim_map_.begin(); // time: O(1); memory: O(1)
-    OrderQueue& lim_queue_ = lim_book_it->second;
-    OrderQueue& peg_queue_ = peg_queue(s);
-
-    Top& t = top(s);
-    t.price = price_of(s, lim_book_it->first);
-    t.is_peg = !peg_queue_.empty() && peg_queue_.front().seq < lim_queue_.front().seq;
-    t.queue = t.is_peg ? &peg_queue_ : &lim_queue_;
+    TopOrder& t = top_order(s);
+    t.is_peg = t_q.lim_queue->empty() || (!peg_queue_.empty() && peg_queue_.front().seq < t_q.lim_queue->front().seq);
+    t.queue = t.is_peg ? &peg_queue_ : t_q.lim_queue;
     t.order = &t.queue->front();
     return true;
 }
@@ -198,36 +53,48 @@ void OrderBook::execute(Order& bid, Order& offer, int price) {
 
 void OrderBook::run_matching() {
     // time: O(1); memory: O(1) per break-condition evaluation.
-    while (resolve_top(Side::Buy) && resolve_top(Side::Sell)) {
-        // time: O(1); memory: O(1).
-        Top& buy = top(Side::Buy);
-        Top& sell = top(Side::Sell);
-
-        if (buy.price < sell.price)
+    while (resolve_top_queue(Side::Buy) && resolve_top_queue(Side::Sell)) {
+        TopQueue& buy_t_q = top_queue(Side::Buy);
+        TopQueue& sell_t_q = top_queue(Side::Sell);
+        
+        if (buy_t_q.price < sell_t_q.price)
             // There is no trade when bid < offer
             break;
 
-        const int price = (buy.order->seq < sell.order->seq) ? buy.price : sell.price;
-        // time: O(1) amortized; memory: O(1) amortized.
-        execute(*buy.order, *sell.order, price);
+        // time: O(1); memory: O(1) per break-condition evaluation.
+        while (resolve_top_order(Side::Buy) && resolve_top_order(Side::Sell)) {
+            // time: O(1); memory: O(1).
+            TopOrder& buy_t = top_order(Side::Buy);
+            TopOrder& sell_t = top_order(Side::Sell);
 
-        // time: O(1), O(log n) when the level empties; memory: O(1).
-        if (buy.order->qty == 0)
-            retire_top(Side::Buy);
-        if (sell.order->qty == 0)
-            retire_top(Side::Sell);
+            const int price = (buy_t.order->seq < sell_t.order->seq)
+                ? buy_t_q.price : sell_t_q.price;
+            // time: O(1) amortized; memory: O(1) amortized.
+            execute(*buy_t.order, *sell_t.order, price);
+
+            // time: O(1), O(log n) when the level empties; memory: O(1).
+            if (buy_t.order->qty == 0)
+                retire_top_order(Side::Buy);
+            if (sell_t.order->qty == 0)
+                retire_top_order(Side::Sell);
+        }
+
+        // time: O(1), O(log n) when the level indeed empties; memory: O(1).
+        if (buy_t_q.lim_queue->empty())
+            lim_map(Side::Buy).erase(key_of(Side::Buy, buy_t_q.price)); // -buy_t_q.price
+        if (sell_t_q.lim_queue->empty())
+            lim_map(Side::Sell).erase(key_of(Side::Sell, sell_t_q.price)); // sell_t_q.price
     }
 }
 
-/* time: O(1), O(log n) when the level empties; memory: O(1). */
-void OrderBook::retire_top(Side s) {
-    Top& t = top(s);
+/* time: O(1); memory: O(1) */
+void OrderBook::retire_top_order(Side s) {
+    TopOrder& t = top_order(s);
+    assert(t.order != nullptr && t.order->qty == 0);
+    assert(t.order == &t.queue->front());
 
-    history_.splice(history_.begin(), *t.queue, t.queue->begin()); // time: O(1), memory: O(1).
-
-    if (!t.is_peg && t.queue->empty())
-        // If the list empties.
-        lim_map(s).erase(key_of(s, t.price)); // time: O(1), memory: O(1).
+    // time: O(1), memory: O(1).
+    history_.splice(history_.begin(), *t.queue, t.queue->begin());
 
     t.order = nullptr;
     t.queue  = nullptr;
@@ -275,7 +142,7 @@ OrderBook::OpResult OrderBook::insert_order(Type type, Side side, int qty,
 
         case Type::Market: {
             const Side opp = opposite(side);
-            if (lim_map(opp).empty()) {
+            if (!resolve_top_queue(opp)) {
                 order.status = Status::Cancelled;
                 history_.emplace_front(order); // time: O(1); memory: O(1).
                 // Create the index;
@@ -284,23 +151,25 @@ OrderBook::OpResult OrderBook::insert_order(Type type, Side side, int qty,
 
                 return {Reject::NoMarketPrice, order.id};
             }
+            do {
+                TopQueue& t_q = top_queue(opp);
+                
+                // time: O(1); memory: O(1) at each break-condition evaluation.
+                while (order.qty > 0 && resolve_top_order(opp)) {
+                    TopOrder& t = top_order(opp);
+                    if (side == Side::Buy)
+                        execute(order, *t.order, t_q.price); // time: O(1) amortized; memory: O(1) amortized.
+                    else
+                        execute(*t.order, order, t_q.price); // time: O(1) amortized; memory: O(1) amortized.
+                    if (t.order->qty == 0)
+                        retire_top_order(opp); // time: O(1); memory: O(1).
+                }
 
-            if (side == Side::Buy)
-                // time: O(1); memory: O(1) at each break-condition evaluation.
-                while (order.qty > 0 && resolve_top(opp)) {
-                    Top& t = top(opp);
-                    execute(order, *t.order, t.price); // time: O(1) amortized; memory: O(1) amortized.
-                    if (t.order->qty == 0)
-                        retire_top(opp); // time: O(1), O(log n) when the level empties; memory: O(1).
-                }
-            else
-                // time: O(1); memory: O(1) at each break-condition evaluation.
-                while (order.qty > 0 && resolve_top(opp)) {
-                    Top& t = top(opp);
-                    execute(*t.order, order, t.price); // time: O(1) amortized; memory: O(1) amortized.
-                    if (t.order->qty == 0)
-                        retire_top(opp); // time: O(1), O(log n) when the level empties; memory: O(1).
-                }
+                // time: O(1), O(log n) when the level indeed empties; memory: O(1).
+                if (t_q.lim_queue->empty())
+                    lim_map(opp).erase(key_of(opp, t_q.price));
+            } while (order.qty > 0 && resolve_top_queue(opp));
+
             order.status = (order.qty == 0)  ? Status::Total
                          : (order.qty < qty) ? Status::Partial
                                              : Status::Cancelled;
@@ -310,6 +179,7 @@ OrderBook::OpResult OrderBook::insert_order(Type type, Side side, int qty,
             break;
         }
     }
+
     return {Reject::None, order.id};
 }
 
@@ -319,7 +189,7 @@ OrderBook::OpResult OrderBook::cancel_order(int order_id) {
 
     OrderQueue::iterator it_queue = ids_[order_id];
     if (it_queue->status == Status::Cancelled)
-        return Reject::AlreadyCanceled;
+        return Reject::AlreadyCancelled;
     if (it_queue->status == Status::Total)
         return Reject::AlreadyFilled;
     if (it_queue->type == Type::Market)
@@ -342,7 +212,7 @@ OrderBook::OpResult OrderBook::cancel_order(int order_id) {
     }
     it_queue->status = Status::Cancelled;
 
-    return {Reject::None};
+    return {Reject::None, order_id};
 }
 
 OrderBook::OpResult OrderBook::change_order(int order_id, int new_qty,
@@ -355,7 +225,7 @@ OrderBook::OpResult OrderBook::change_order(int order_id, int new_qty,
 
     OrderQueue::iterator it_queue = ids_[order_id];
     if (it_queue->status == Status::Cancelled)
-        return Reject::AlreadyCanceled;
+        return Reject::AlreadyCancelled;
     if (it_queue->status == Status::Total)
         return Reject::AlreadyFilled;
     if (it_queue->type == Type::Market)
@@ -391,8 +261,8 @@ OrderBook::OpResult OrderBook::change_order(int order_id, int new_qty,
             new_map_it = lim_map(it_queue->side).try_emplace(key_of(it_queue->side, it_queue->price)).first;
         }
         if (loses_priority)
-        // time: O(1); memory: O(1).
-        // Moves the order to the back of the queue.
+            // time: O(1); memory: O(1).
+            // Moves the order to the back of the queue.
             new_map_it->second.splice(new_map_it->second.end(), map_it->second, it_queue);
         if (price_changed) {
             if (map_it->second.empty())
@@ -403,11 +273,12 @@ OrderBook::OpResult OrderBook::change_order(int order_id, int new_qty,
         }
     }
 
-    return {Reject::None};
+    return {Reject::None, order_id};
 }
 
-std::vector<OrderBook::BookOut> OrderBook::book_view(Side s) const {
-    std::vector<BookOut> view;
+void OrderBook::book_view(Side s, std::vector<BookOut>& view) const {
+    view.clear();
+
     const BookMap& lim_map_ = lim_map(s);
     const OrderQueue& peg_queue_ = peg_queue(s);
 
@@ -443,13 +314,10 @@ std::vector<OrderBook::BookOut> OrderBook::book_view(Side s) const {
                 // time: O(1) amortized; memory: O(1) amortized.
                 view.emplace_back(lim_order.id, lim_order.qty, lim_order.price, lim_order.type, lim_order.status);
     }
-
-    return view;
 }
 
 const Order* OrderBook::locate_order(int order_id) const {
     return (order_id < 0 || static_cast<std::size_t>(order_id) >= ids_.size()) ? nullptr : &*ids_[order_id];
 }
 
-}
-
+} // namespace orderbook

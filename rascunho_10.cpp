@@ -129,7 +129,7 @@ class OrderBook {
         }
 
         // 24 Bytes (in a 64-bit machine; 16 Bytes in a 32-bit).
-        struct Top {
+        struct TopOrder {
             OrderQueue* queue = nullptr;
             Order* order = nullptr;
             int price = 0;
@@ -140,11 +140,11 @@ class OrderBook {
         const BookMap&    lim_map(Side s)   const noexcept { return lim_book_[idx(s)]; }
         OrderQueue&       peg_queue(Side s)       noexcept { return peg_book_[idx(s)]; }
         const OrderQueue& peg_queue(Side s) const noexcept { return peg_book_[idx(s)]; }
-        Top&              top(Side s)             noexcept { return top_[idx(s)]; }
+        TopOrder&         top_order(Side s)       noexcept { return top_orders_[idx(s)]; }
 
-        bool resolve_top(Side s) noexcept;
+        bool resolve_top_order(Side s) noexcept;
         void execute(Order& bid, Order& offer, int price);
-        void retire_top(Side s);
+        void retire_top_order(Side s);
         void run_matching();
 
         // The index order of map_book must be kept according to Side struct: Side::Sell = 0, Side::Buy = 1.
@@ -154,7 +154,7 @@ class OrderBook {
         OrderQueue peg_book_[2];
         OrderQueue history_;
         std::vector<OrderQueue::iterator> ids_;
-        Top top_[2];
+        TopOrder top_orders_[2];
         std::vector<Trade> trades_;
 
         int seq_count_ = 0; // book time.
@@ -167,18 +167,15 @@ OrderBook::OrderBook() {
 }
 
 /* time: O(1); memory: O(1). */
-bool OrderBook::resolve_top(Side s) noexcept {
-    BookMap& lim_map_ = lim_map(s);
-    if (lim_map_.empty())
+bool OrderBook::resolve_top_order(Side s) noexcept {
+    assert(!lim_map(s).empty());
+    OrderQueue& lim_queue_ = lim_map(s).begin()->second;
+    OrderQueue& peg_queue_ = peg_queue(s);
+    if (peg_queue_.empty() && lim_queue_.empty())
         return false;
 
-    auto lim_book_it = lim_map_.begin(); // time: O(1); memory: O(1)
-    OrderQueue& lim_queue_ = lim_book_it->second;
-    OrderQueue& peg_queue_ = peg_queue(s);
-
-    Top& t = top(s);
-    t.price = price_of(s, lim_book_it->first);
-    t.is_peg = !peg_queue_.empty() && peg_queue_.front().seq < lim_queue_.front().seq;
+    TopOrder& t = top_order(s);
+    t.is_peg = lim_queue_.empty() || (!peg_queue_.empty() && peg_queue_.front().seq < lim_queue_.front().seq);
     t.queue = t.is_peg ? &peg_queue_ : &lim_queue_;
     t.order = &t.queue->front();
     return true;
@@ -197,37 +194,50 @@ void OrderBook::execute(Order& bid, Order& offer, int price) {
 }
 
 void OrderBook::run_matching() {
-    // time: O(1); memory: O(1) per break-condition evaluation.
-    while (resolve_top(Side::Buy) && resolve_top(Side::Sell)) {
-        // time: O(1); memory: O(1).
-        Top& buy = top(Side::Buy);
-        Top& sell = top(Side::Sell);
-
-        if (buy.price < sell.price)
+    while (true) {
+        auto& buy_map = lim_map(Side::Buy);
+        auto& sell_map = lim_map(Side::Sell);
+        if(buy_map.empty() || sell_map.empty())
+            break;
+        if (-buy_map.begin()->first < sell_map.begin()->first)
+            // Important to note the minus sign in the buy map key.
+            // price_of(Side::Buy, buy_map.begin()->first) < price_of(Side::Sell, sell_map.begin()->first)
             // There is no trade when bid < offer
             break;
 
-        const int price = (buy.order->seq < sell.order->seq) ? buy.price : sell.price;
-        // time: O(1) amortized; memory: O(1) amortized.
-        execute(*buy.order, *sell.order, price);
+        while (resolve_top_order(Side::Buy) && resolve_top_order(Side::Sell)) {
+            // time: O(1); memory: O(1).
+            TopOrder& buy_t = top_order(Side::Buy);
+            TopOrder& sell_t = top_order(Side::Sell);
 
-        // time: O(1), O(log n) when the level empties; memory: O(1).
-        if (buy.order->qty == 0)
-            retire_top(Side::Buy);
-        if (sell.order->qty == 0)
-            retire_top(Side::Sell);
+            // Important to note the minus sign in the buy map key;
+            // price_of(Side::Buy, buy_map.begin()->first) : price_of(Side::Sell, sell_map.begin()->first)
+            const int price = (buy_t.order->seq < sell_t.order->seq)
+                ? -buy_map.begin()->first : sell_map.begin()->first;
+            // time: O(1) amortized; memory: O(1) amortized.
+            execute(*buy_t.order, *sell_t.order, price);
+
+            // time: O(1), O(log n) when the level empties; memory: O(1).
+            if (buy_t.order->qty == 0)
+                retire_top_order(Side::Buy);
+            if (sell_t.order->qty == 0)
+                retire_top_order(Side::Sell);
+        }
+
+        // time: O(1), O(log n) when the level indeed empties; memory: O(1).
+        if (buy_map.begin()->second.empty())
+            buy_map.erase(buy_map.begin()->first);
+        if (sell_map.begin()->second.empty())
+            sell_map.erase(sell_map.begin()->first);
     }
 }
 
-/* time: O(1), O(log n) when the level empties; memory: O(1). */
-void OrderBook::retire_top(Side s) {
-    Top& t = top(s);
+/* time: O(1); memory: O(1) */
+void OrderBook::retire_top_order(Side s) {
+    TopOrder& t = top_order(s);
 
-    history_.splice(history_.begin(), *t.queue, t.queue->begin()); // time: O(1), memory: O(1).
-
-    if (!t.is_peg && t.queue->empty())
-        // If the list empties.
-        lim_map(s).erase(key_of(s, t.price)); // time: O(1), memory: O(1).
+    // time: O(1), memory: O(1).
+    history_.splice(history_.begin(), *t.queue, t.queue->begin());
 
     t.order = nullptr;
     t.queue  = nullptr;
@@ -275,7 +285,8 @@ OrderBook::OpResult OrderBook::insert_order(Type type, Side side, int qty,
 
         case Type::Market: {
             const Side opp = opposite(side);
-            if (lim_map(opp).empty()) {
+            auto& opp_map = lim_map(opp);
+            if (opp_map.empty()) {
                 order.status = Status::Cancelled;
                 history_.emplace_front(order); // time: O(1); memory: O(1).
                 // Create the index;
@@ -284,23 +295,28 @@ OrderBook::OpResult OrderBook::insert_order(Type type, Side side, int qty,
 
                 return {Reject::NoMarketPrice, order.id};
             }
-
+            
+            const int price = price_of(opp, opp_map.begin()->first);
             if (side == Side::Buy)
                 // time: O(1); memory: O(1) at each break-condition evaluation.
-                while (order.qty > 0 && resolve_top(opp)) {
-                    Top& t = top(opp);
-                    execute(order, *t.order, t.price); // time: O(1) amortized; memory: O(1) amortized.
+                while (order.qty > 0 && resolve_top_order(opp)) {
+                    TopOrder& t = top_order(opp);
+                    execute(order, *t.order, price); // time: O(1) amortized; memory: O(1) amortized.
                     if (t.order->qty == 0)
-                        retire_top(opp); // time: O(1), O(log n) when the level empties; memory: O(1).
+                        retire_top_order(opp); // time: O(1); memory: O(1).
                 }
             else
                 // time: O(1); memory: O(1) at each break-condition evaluation.
-                while (order.qty > 0 && resolve_top(opp)) {
-                    Top& t = top(opp);
-                    execute(*t.order, order, t.price); // time: O(1) amortized; memory: O(1) amortized.
+                while (order.qty > 0 && resolve_top_order(opp)) {
+                    TopOrder& t = top_order(opp);
+                    execute(*t.order, order, price); // time: O(1) amortized; memory: O(1) amortized.
                     if (t.order->qty == 0)
-                        retire_top(opp); // time: O(1), O(log n) when the level empties; memory: O(1).
+                        retire_top_order(opp); // time: O(1); memory: O(1).
                 }
+            // time: O(1), O(log n) when the level indeed empties; memory: O(1).
+            if (opp_map.begin()->second.empty())
+                opp_map.erase(opp_map.begin()->first);
+
             order.status = (order.qty == 0)  ? Status::Total
                          : (order.qty < qty) ? Status::Partial
                                              : Status::Cancelled;
