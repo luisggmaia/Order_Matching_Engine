@@ -69,6 +69,8 @@ void OrderBook::run_matching() {
 
             const int price = (buy_t.order->seq < sell_t.order->seq)
                 ? buy_t_q.price : sell_t_q.price;
+            // ? std::min(buy_t_q.price, sell_t_q.price) : std::max(buy_t_q.price, sell_t_q.price)
+            // The prioritary order would have the best price, in this case.
             // time: O(1) amortized; memory: O(1) amortized.
             execute(*buy_t.order, *sell_t.order, price);
 

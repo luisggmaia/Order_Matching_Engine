@@ -8,21 +8,6 @@
 #include <functional>
 
 
-// class OrderedMap
-//
-// std::map (ordem por chave, segundo Compare) + std::unordered_map (indice
-// Key -> Map::iterator) para permitir busca O(1) mantendo a ordenacao do
-// std::map.
-//
-// Compare e o mesmo parametro de comparacao do std::map: std::less<Key>
-// (padrao, ordem crescente) ou std::greater<Key> (ordem decrescente), ou
-// qualquer comparador proprio. O unordered_map de indice nao depende de
-// Compare, pois busca por chave nele independe de ordem.
-//
-// Definicao completa aqui no header: e uma classe template, entao o
-// compilador precisa ver o corpo inteiro em cada translation unit que a
-// instancia (nao ha ODR-safe split em .hpp/.cpp sem instanciacao explicita).
-
 template <typename Key, typename Value, typename Compare = std::less<Key>>
 class OrderedMap {
     public:
@@ -85,7 +70,7 @@ class OrderedMap {
         }
 
         bool erase(const Key& key) {
-            // time: O(1) index lookup + O(log n) map erase; memory: O(1)
+            // time: O(1) index lookup + O(log n) map erase (amortized O(1)); memory: O(1)
             auto idx_it = index.find(key);
             if (idx_it == index.end())
                 return false;
